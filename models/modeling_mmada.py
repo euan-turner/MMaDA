@@ -26,6 +26,7 @@ import torch.backends.cuda
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import einsum
+from torch.autograd.profiler import record_function
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel, AutoConfig, AutoModelForCausalLM
@@ -152,61 +153,72 @@ class MMadaModelLM(LLaDAModelLM):
         if uncond_input_ids is not None:
             uncond_prefix = uncond_input_ids[:, :resolution + 1]
 
+
+        # Precompute mask_len for all steps on GPU, to avoid CPU->GPU sync
+        device = input_ids.device
+        ratios = torch.linspace(1.0/timesteps, 1.0, timesteps, device=device)
+        mask_ratios = noise_schedule(ratios)
+        
+        pre_mask_lens = (num_vq_tokens * mask_ratios).floor().unsqueeze(1) 
+        
         for step in range(timesteps):
-            if uncond_input_ids is not None and guidance_scale > 0:
-                uncond_input_ids = torch.cat(
-                    [uncond_prefix, input_ids[:, resolution + 1:]], dim=1)
-                model_input = torch.cat([input_ids, uncond_input_ids])
-                all_attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
-                attention_bias = (all_attention_mask[:, :, None] & all_attention_mask[:, None, :]).bool().unsqueeze(1)
-                logits = self(model_input, attention_bias=attention_bias).logits 
-                # print(f"logits.shape: {logits.shape}")
-                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
-                # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
-                # it seems that muse has a different cfg setting
-                logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
-            else:
-                attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
-                logits = self(input_ids, attention_bias=attention_bias).logits
-                logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+            with record_function("t2i_diffusion_step"):
+                if uncond_input_ids is not None and guidance_scale > 0:
+                    uncond_input_ids = torch.cat(
+                        [uncond_prefix, input_ids[:, resolution + 1:]], dim=1)
+                    model_input = torch.cat([input_ids, uncond_input_ids])
+                    all_attention_mask = torch.cat([attention_mask, uncond_attention_mask], dim=0)
+                    attention_bias = (all_attention_mask[:, :, None] & all_attention_mask[:, None, :]).bool().unsqueeze(1)
+                    logits = self(model_input, attention_bias=attention_bias).logits 
+                    # print(f"logits.shape: {logits.shape}")
+                    cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
+                    # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
+                    # it seems that muse has a different cfg setting
+                    logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
+                    logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
+                else:
+                    attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
+                    logits = self(input_ids, attention_bias=attention_bias).logits
+                    logits = logits[:, -(num_vq_tokens + 1):-1, len(uni_prompting.text_tokenizer) + num_new_special_tokens: len(uni_prompting.text_tokenizer) + num_new_special_tokens + codebook_size]
 
             # logits: 1, 1024, 8192
             # print(f"logits.shape: {logits.shape}")
-            probs = logits.softmax(dim=-1)
-            sampled = probs.reshape(-1, logits.size(-1))
-            # print(f"probs: {probs}, probs.shape: {probs.shape}, sampled: {sampled}, sampled.shape: {sampled.shape}")
-            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1]) # 1, 1024
+            with record_function("t2i_unmask"):
+                probs = logits.softmax(dim=-1) # purple softmax
+                sampled = probs.reshape(-1, logits.size(-1)) # dark green reshape
+                # print(f"probs: {probs}, probs.shape: {probs.shape}, sampled: {sampled}, sampled.shape: {sampled.shape}")
+                sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1]) # 1, 1024 
 
-            unknown_map = input_ids_minus_lm_vocab_size == mask_token_id
-            # print(f"unknown_map.sum(dim=-1, keepdim=True): {unknown_map.sum(dim=-1, keepdim=True)}")
-            sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size)
-            # Defines the mask ratio for the next round. The number to mask out is
-            # determined by mask_ratio * unknown_number_in_the_beginning.
-            ratio = 1.0 * (step + 1) / timesteps
-            mask_ratio = noise_schedule(torch.tensor(ratio))
-            # Computes the probabilities of each selected tokens.
-            selected_probs = torch.gather(probs, -1, sampled_ids.long()[..., None])
-            selected_probs = selected_probs.squeeze(-1)
+                unknown_map = input_ids_minus_lm_vocab_size == mask_token_id # eq
+                # print(f"unknown_map.sum(dim=-1, keepdim=True): {unknown_map.sum(dim=-1, keepdim=True)}")
+                sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size) # where
+                # Defines the mask ratio for the next round. The number to mask out is
+                # determined by mask_ratio * unknown_number_in_the_beginning.
+                
+                # Computes the probabilities of each selected tokens.
+                selected_probs = torch.gather(probs, -1, sampled_ids.long()[..., None])
+                selected_probs = selected_probs.squeeze(-1)
 
-            # Ignores the tokens given in the input by overwriting their confidence.
-            selected_probs = torch.where(unknown_map, selected_probs, torch.finfo(selected_probs.dtype).max)
-            # Gets mask lens for each sample in the batch according to the mask ratio.
-            mask_len = (num_vq_tokens * mask_ratio).floor().unsqueeze(0).to(logits.device)
-            # Keeps at least one of prediction in this round and also masks out at least
-            # one and for the next iteration
-            mask_len = torch.max(
-                torch.tensor([1], device=logits.device), torch.min(unknown_map.sum(dim=-1, keepdim=True) - 1, mask_len)
-            )
-            # print(f"mask_len: {mask_len}, mask_len.shape: {mask_len.shape}")
-            # Adds noise for randomness
-            temperature = temperature * (1.0 - ratio)
-            masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
-            # Masks tokens with lower confidence.
-            input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
-                                                          sampled_ids + len(uni_prompting.text_tokenizer)
-                                                          + num_new_special_tokens)
-            input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
+                # Ignores the tokens given in the input by overwriting their confidence.
+                selected_probs = torch.where(unknown_map, selected_probs, torch.finfo(selected_probs.dtype).max)
+                # Gets mask lens for each sample in the batch according to the mask ratio.
+                
+                raw_mask_len = pre_mask_lens[step]
+
+                # Keeps at least one of prediction in this round and also masks out at least
+                # one and for the next iteration
+                mask_len = torch.min(unknown_map.sum(dim=-1, keepdim=True) - 1, raw_mask_len)
+                mask_len = torch.clamp(mask_len, min=1)
+                
+                # print(f"mask_len: {mask_len}, mask_len.shape: {mask_len.shape}")
+                # Adds noise for randomness
+                temperature = temperature * (1.0 - ratios[step])
+                masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
+                # Masks tokens with lower confidence.
+                input_ids[:, -(num_vq_tokens + 1):-1] = torch.where(masking, mask_token_id,
+                                                            sampled_ids + len(uni_prompting.text_tokenizer)
+                                                            + num_new_special_tokens)
+                input_ids_minus_lm_vocab_size = torch.where(masking, mask_token_id, sampled_ids)
 
         return sampled_ids
     
@@ -407,43 +419,45 @@ class MMadaModelLM(LLaDAModelLM):
         # print(f"num_blocks: {num_blocks}, steps: {steps}")
         # num_transfer_tokens = get_num_transfer_tokens(prompt_index, steps)
         for num_block in range(num_blocks):
-            block_mask_index = (x[:, idx.shape[1] + num_block * block_length: idx.shape[1] + (num_block + 1) * block_length:] == mask_id)
-            num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-            # num_transfer_tokens = get_num_transfer_tokens(prompt_index, steps)
-            # print(f"num_transfer_tokens: {num_transfer_tokens}, num_transfer_tokens.shape: {num_transfer_tokens.shape}")
-            for i in range(steps):
-                mask_index = (x == mask_id) 
-                if cfg_scale > 0.0:
-                    un_x = x.clone()
-                    un_x[prompt_index] = mask_id
-                    x_ = torch.cat([x, un_x], dim=0)
-                    logits = self(x_).logits
-                    logits, un_logits = torch.chunk(logits, 2, dim=0)
-                    logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-                else:
-                    logits = self(x, attention_bias=attention_bias).logits
-                
-                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-                if remasking == 'low_confidence':
-                    p = F.softmax(logits.to(torch.float64), dim=-1)
-                    x0_p = torch.squeeze(
-                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-                elif remasking == 'random':
-                    x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-                else:
-                    raise NotImplementedError(remasking)
+            with record_function("mmu_block_generate"):
+                block_mask_index = (x[:, idx.shape[1] + num_block * block_length: idx.shape[1] + (num_block + 1) * block_length:] == mask_id)
+                num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+                # num_transfer_tokens = get_num_transfer_tokens(prompt_index, steps)
+                # print(f"num_transfer_tokens: {num_transfer_tokens}, num_transfer_tokens.shape: {num_transfer_tokens.shape}")
+                for i in range(steps):
+                    with record_function("mmu_diffusion_step"):
+                        mask_index = (x == mask_id) 
+                        if cfg_scale > 0.0:
+                            un_x = x.clone()
+                            un_x[prompt_index] = mask_id
+                            x_ = torch.cat([x, un_x], dim=0)
+                            logits = self(x_).logits
+                            logits, un_logits = torch.chunk(logits, 2, dim=0)
+                            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                        else:
+                            logits = self(x, attention_bias=attention_bias).logits
+                    
+                    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+                    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+                    if remasking == 'low_confidence':
+                        p = F.softmax(logits.to(torch.float64), dim=-1)
+                        x0_p = torch.squeeze(
+                            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+                    elif remasking == 'random':
+                        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+                    else:
+                        raise NotImplementedError(remasking)
 
-                x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
+                    x0_p[:, idx.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
-                x0 = torch.where(mask_index, x0, x)
-                confidence = torch.where(mask_index, x0_p, -np.inf)
+                    x0 = torch.where(mask_index, x0, x)
+                    confidence = torch.where(mask_index, x0_p, -np.inf)
 
-                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                    transfer_index[j, select_index] = True
-                x[transfer_index] = x0[transfer_index]
+                    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                    for j in range(confidence.shape[0]):
+                        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                        transfer_index[j, select_index] = True
+                    x[transfer_index] = x0[transfer_index]
                 
             
             # logits = logits[:, -1, :] / temperature
